@@ -330,4 +330,372 @@ def collect_companies(
 
     for chunk_start, chunk_end in daterange_chunks(
         parse_date(date_from),
-        parse_
+        parse_date(date_to),
+        chunk_days=7,
+    ):
+        chunk_from = chunk_start.strftime("%Y-%m-%d")
+        chunk_to = chunk_end.strftime("%Y-%m-%d")
+
+        sic_companies = search_sic_companies(client, chunk_from, chunk_to)
+        buzzword_companies = search_buzzword_companies(client, chunk_from, chunk_to)
+
+        combined = {}
+        for company in sic_companies + buzzword_companies:
+            company_number = company.get("company_number")
+            if company_number:
+                combined[company_number] = company
+
+        for company in combined.values():
+            company_number = company.get("company_number")
+            company_name = company.get("company_name", "")
+            sic_codes = company.get("sic_codes", []) or []
+            ro_address = company.get("registered_office_address", {}) or {}
+            ro_postcode = ro_address.get("postal_code") or ro_address.get("postcode") or company.get("postcode")
+
+            if not company_number or company_number in seen_companies:
+                continue
+
+            if not (sic_matches(sic_codes) or name_has_buzzwords(company_name)):
+                continue
+
+            officers = get_company_officers(client, company_number)
+            directors = [o for o in officers if is_active_director(o)]
+
+            director_names = []
+            director_postcodes = []
+            has_target_country = False
+            has_multi_appointment_director = False
+
+            for d in directors:
+                director_names.append(d.get("name", ""))
+                d_postcode = (d.get("address") or {}).get("postal_code", "")
+                director_postcodes.append(d_postcode)
+
+                nationality = normalize_country(d.get("nationality"))
+                residence = normalize_country(d.get("country_of_residence"))
+
+                if nationality in TARGET_COUNTRIES or residence in TARGET_COUNTRIES:
+                    has_target_country = True
+
+                officer_id = get_officer_id(d)
+                if officer_id:
+                    appt_count = get_officer_appointments_count(client, officer_id, officer_cache)
+                    if appt_count > 1:
+                        has_multi_appointment_director = True
+
+            first_director_name = director_names[0] if director_names else ""
+
+            row = {
+                "company_name": company_name,
+                "company_number": company_number,
+                "SIC Group": get_sic_group(sic_codes, company_name),
+                "Directors": len(directors),
+                "sic_codes": "; ".join(sic_codes),
+                "Postcode": trim_postcode_area(ro_postcode),
+                "In Target Postcode": postcode_prefix_matches(ro_postcode),
+                "international?": has_target_country,
+                "Serial Founder": has_multi_appointment_director,
+                "Assumed Email": make_assumed_email(first_director_name, company_name),
+            }
+
+            for i, name in enumerate(director_names, start=1):
+                row[f"director_{i}_name"] = name
+            for i, pc in enumerate(director_postcodes, start=1):
+                row[f"director_{i}_postcode"] = pc
+
+            all_rows.append(row)
+            seen_companies.add(company_number)
+
+    return all_rows
+
+
+def write_results_csv(rows: List[dict], filename: str):
+    if not rows:
+        return
+
+    new_df = pd.DataFrame(rows)
+
+    if os.path.exists(filename):
+        try:
+            existing_df = pd.read_csv(filename)
+        except Exception:
+            existing_df = pd.DataFrame()
+    else:
+        existing_df = pd.DataFrame()
+
+    combined = pd.concat([existing_df, new_df], ignore_index=True) if not existing_df.empty else new_df
+
+    if "company_number" in combined.columns:
+        combined = combined.drop_duplicates(subset=["company_number"], keep="last")
+    else:
+        combined = combined.drop_duplicates()
+
+    combined.to_csv(filename, index=False, encoding="utf-8-sig")
+
+
+def load_results_df() -> pd.DataFrame:
+    if os.path.exists(RESULTS_FILE):
+        try:
+            return pd.read_csv(RESULTS_FILE)
+        except Exception:
+            return pd.DataFrame()
+    return pd.DataFrame()
+
+
+def prepare_display_df(df: pd.DataFrame) -> pd.DataFrame:
+    if df.empty:
+        return df
+
+    display_df = df.copy()
+    display_df = display_df.drop(columns=["company_number"], errors="ignore")
+
+    ordered_cols = [
+        "company_name",
+        "Assumed Email",
+        "SIC Group",
+        "Directors",
+        "sic_codes",
+        "Postcode",
+        "In Target Postcode",
+        "international?",
+        "Serial Founder",
+    ]
+    dynamic_cols = [c for c in display_df.columns if c not in ordered_cols]
+    final_cols = [c for c in ordered_cols if c in display_df.columns] + dynamic_cols
+
+    display_df = display_df[final_cols]
+
+    rename_map = {
+        "company_name": "Company Name",
+        "sic_codes": "SIC Codes",
+    }
+    return display_df.rename(columns=rename_map)
+
+
+def run_pipeline(api_keys: List[str], date_from: str, date_to: str):
+    seen_companies = set(load_json_file(SEEN_FILE, []))
+    officer_cache = load_json_file(OFFICER_CACHE_FILE, {})
+
+    client = RotatingCHClient(api_keys, rotate_every=599)
+    rows = collect_companies(client, date_from, date_to, seen_companies, officer_cache)
+
+    save_json_file(SEEN_FILE, sorted(seen_companies))
+    save_json_file(OFFICER_CACHE_FILE, officer_cache)
+    write_results_csv(rows, RESULTS_FILE)
+
+    return rows
+
+
+def build_copy_button_html(text_to_copy: str, button_label: str = "Copy") -> str:
+    safe_display_text = html.escape(text_to_copy or "", quote=False)
+    safe_input_value = html.escape(text_to_copy or "", quote=True)
+    safe_button_label = html.escape(button_label, quote=True)
+
+    return f"""
+    <html>
+      <head>
+        <meta charset=\"UTF-8\">
+        <style>
+          body {{
+            margin: 0;
+            font-family: 'Source Sans Pro', sans-serif;
+            background: transparent;
+          }}
+          .wrap {{
+            display: flex;
+            align-items: center;
+            gap: 8px;
+            width: 100%;
+            overflow: hidden;
+            padding: 2px 0;
+          }}
+          .name {{
+            flex: 1;
+            min-width: 0;
+            white-space: nowrap;
+            overflow: hidden;
+            text-overflow: ellipsis;
+            font-size: 14px;
+            line-height: 1.3;
+          }}
+          button {{
+            border: 1px solid rgba(49, 51, 63, 0.2);
+            border-radius: 8px;
+            background: white;
+            padding: 4px 10px;
+            font-size: 12px;
+            cursor: pointer;
+            white-space: nowrap;
+          }}
+          button:hover {{
+            background: #f5f7fb;
+          }}
+        </style>
+      </head>
+      <body>
+        <div class=\"wrap\">
+          <div class=\"name\" title=\"{safe_input_value}\">{safe_display_text}</div>
+          <button id=\"copyButton\" type=\"button\">{safe_button_label}</button>
+        </div>
+        <input id=\"textToCopy\" value=\"{safe_input_value}\" style=\"position:absolute;left:-9999px;top:-9999px;\" />
+        <script>
+          const copyButton = document.getElementById('copyButton');
+          const textToCopy = document.getElementById('textToCopy');
+
+          async function copyToClipboard() {{
+            try {{
+              await navigator.clipboard.writeText(textToCopy.value);
+            }} catch (err) {{
+              textToCopy.select();
+              document.execCommand('copy');
+            }}
+            const originalLabel = copyButton.textContent;
+            copyButton.textContent = 'Copied';
+            setTimeout(() => {{
+              copyButton.textContent = originalLabel;
+            }}, 1000);
+          }}
+
+          copyButton.addEventListener('click', copyToClipboard);
+        </script>
+      </body>
+    </html>
+    """
+
+
+def render_copy_company_name(company_name: str, company_number: str):
+    iframe_html = build_copy_button_html(company_name, "Copy")
+    components.html(iframe_html, height=42)
+
+
+def render_interactive_results(df: pd.DataFrame):
+    if df.empty:
+        st.info("No results yet.")
+        return
+
+    st.markdown("### Results")
+
+    header_cols = st.columns([2.6, 1.8, 1.1, 0.8, 1.8, 0.9, 1.0, 1.0, 1.0])
+    headers = [
+        "Company Name",
+        "Assumed Email",
+        "SIC Group",
+        "Directors",
+        "SIC Codes",
+        "Postcode",
+        "Target PC",
+        "Intl",
+        "Serial Founder",
+    ]
+    for col, label in zip(header_cols, headers):
+        col.markdown(f"**{label}**")
+
+    st.divider()
+
+    fixed_columns = {
+        "company_name",
+        "company_number",
+        "Assumed Email",
+        "SIC Group",
+        "Directors",
+        "sic_codes",
+        "Postcode",
+        "In Target Postcode",
+        "international?",
+        "Serial Founder",
+    }
+
+    for _, row in df.iterrows():
+        cols = st.columns([2.6, 1.8, 1.1, 0.8, 1.8, 0.9, 1.0, 1.0, 1.0])
+
+        with cols[0]:
+            render_copy_company_name(str(row.get("company_name", "")), str(row.get("company_number", "")))
+        with cols[1]:
+            st.write(row.get("Assumed Email", ""))
+        with cols[2]:
+            st.write(row.get("SIC Group", ""))
+        with cols[3]:
+            st.write(row.get("Directors", ""))
+        with cols[4]:
+            st.write(row.get("sic_codes", ""))
+        with cols[5]:
+            st.write(row.get("Postcode", ""))
+        with cols[6]:
+            st.write("Yes" if bool(row.get("In Target Postcode", False)) else "No")
+        with cols[7]:
+            st.write("Yes" if bool(row.get("international?", False)) else "No")
+        with cols[8]:
+            st.write("Yes" if bool(row.get("Serial Founder", False)) else "No")
+
+        extra_data = {}
+        for column_name in df.columns:
+            if column_name in fixed_columns:
+                continue
+            value = row.get(column_name, "")
+            if pd.notna(value) and str(value).strip():
+                extra_data[column_name] = value
+
+        if extra_data:
+            with st.expander(f"More details · {row.get('company_name', '')}"):
+                st.json(extra_data)
+
+        st.divider()
+
+
+def main():
+    st.set_page_config(page_title="Companies House Finder", layout="wide")
+    st.title("Companies House Finder")
+    st.caption("Search newly incorporated companies and copy company names with one click.")
+
+    api_keys = get_api_keys_from_sources()
+
+    with st.sidebar:
+        st.header("Controls")
+        default_to = datetime.utcnow().date()
+        default_from = default_to - timedelta(days=7)
+
+        date_from = st.date_input("Date from", value=default_from)
+        date_to = st.date_input("Date to", value=default_to)
+        auto_refresh = st.checkbox("Auto refresh page", value=False)
+        auto_run = st.checkbox("Run pipeline on refresh", value=False)
+
+        if auto_refresh:
+            inject_auto_refresh(AUTO_REFRESH_SECONDS)
+            st.caption(f"Refreshing every {AUTO_REFRESH_SECONDS} seconds.")
+
+        st.markdown("---")
+        st.write(f"API keys loaded: {len(api_keys)}")
+
+    if not api_keys:
+        st.error("No Companies House API keys found. Set COMPANIES_HOUSE_API_KEYS in Streamlit secrets or environment variables.")
+        st.stop()
+
+    run_now = st.button("Run pipeline now", type="primary")
+    should_auto_run = auto_refresh and auto_run
+
+    if run_now or should_auto_run:
+        with st.spinner("Running Companies House pipeline..."):
+            rows = run_pipeline(api_keys, str(date_from), str(date_to))
+        st.success(f"Pipeline completed. New companies added: {len(rows)}")
+
+    results_df = load_results_df()
+
+    if not results_df.empty:
+        st.download_button(
+            "Download CSV",
+            data=results_df.to_csv(index=False).encode("utf-8-sig"),
+            file_name=RESULTS_FILE,
+            mime="text/csv",
+        )
+
+    tab1, tab2 = st.tabs(["Interactive view", "Plain dataframe view"])
+
+    with tab1:
+        render_interactive_results(results_df)
+
+    with tab2:
+        st.dataframe(prepare_display_df(results_df), width="stretch", hide_index=True)
+
+
+if __name__ == "__main__":
+    main()
