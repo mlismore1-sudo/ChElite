@@ -2,7 +2,7 @@ import json
 import os
 import time
 import html
-from datetime import datetime, timedelta
+from datetime import datetime
 from pathlib import Path
 from typing import List, Optional, Tuple
 
@@ -15,20 +15,8 @@ from urllib3.util.retry import Retry
 
 BASE_URL = "https://api.company-information.service.gov.uk"
 AUTO_REFRESH_SECONDS = 3
-AUTO_RUN_EVERY_SECONDS = 60
 REQUEST_TIMEOUT = (5, 20)
 MAX_RESULTS_PER_PAGE = 5000
-
-TARGET_POSTCODE_PREFIXES = {
-    "OX1", "OX2", "OX3", "OX4", "OX11", "OX14",
-    "CB1", "CB2", "CB3", "CB4", "CB21", "CB22", "CB23", "CB24",
-    "M1", "M2", "M13", "M14", "M15", "M50",
-    "BT1", "BT2", "BT3", "BT4", "BT5", "BT7", "BT8", "BT9",
-    "EC1V", "EC1", "E1", "N1", "N7", "W12", "E20", "E14", "SE1",
-    "EH1", "EH2", "EH3", "EH8", "EH9", "EH12", "EH16",
-    "B1", "B2", "B3", "B4", "B5", "B7", "B12", "B15", "B19",
-    "BS1", "BS2", "BS3", "BS8", "BS9", "BS16", "BS34"
-}
 
 TECH_SIC_CODES = {
     "58210", "58290", "59111", "59113", "59120", "59140", "59133", "59200",
@@ -48,13 +36,6 @@ BUZZWORD_TERMS = [
     "Europe", "Pty", "PLC", "Pvt", "BV", "B.V", "Capital",
     "Investment", "Ventures"
 ]
-
-TARGET_COUNTRIES = {
-    "united states", "usa", "us",
-    "germany", "france", "netherlands", "spain", "finland",
-    "denmark", "norway", "sweden", "austria", "poland",
-    "greece", "portugal", "italy", "belgium", "hong kong"
-}
 
 SEEN_FILE = "seen_companies.json"
 RESULTS_FILE = "companies_house_results.csv"
@@ -173,36 +154,6 @@ def save_json_file(path: str, data):
         json.dump(data, f, ensure_ascii=False, indent=2)
 
 
-def parse_date(s: str) -> datetime:
-    return datetime.strptime(s, "%Y-%m-%d")
-
-
-def daterange_chunks(start_date: datetime, end_date: datetime, chunk_days: int = 14):
-    current = start_date
-    while current <= end_date:
-        chunk_end = min(current + timedelta(days=chunk_days - 1), end_date)
-        yield current, chunk_end
-        current = chunk_end + timedelta(days=1)
-
-
-def normalize_country(value: Optional[str]) -> str:
-    return (value or "").strip().lower()
-
-
-def trim_postcode_area(postcode: Optional[str]) -> str:
-    if not postcode:
-        return ""
-    postcode = postcode.strip().upper()
-    return postcode[:-3].strip() if len(postcode) > 3 else postcode
-
-
-def postcode_prefix_matches(postcode: Optional[str]) -> bool:
-    if not postcode:
-        return False
-    postcode = postcode.strip().upper()
-    return any(postcode.startswith(prefix) for prefix in TARGET_POSTCODE_PREFIXES)
-
-
 def sic_matches(company_sic_codes: List[str]) -> bool:
     return any(code in TARGET_SIC_CODES for code in (company_sic_codes or []))
 
@@ -221,6 +172,13 @@ def get_sic_group(company_sic_codes: List[str], company_name: str) -> str:
     if name_has_buzzwords(company_name) and "Buzzwords" not in groups:
         groups.append("Buzzwords")
     return ", ".join(groups) if groups else "Other"
+
+
+def trim_postcode_area(postcode: Optional[str]) -> str:
+    if not postcode:
+        return ""
+    postcode = postcode.strip().upper()
+    return postcode[:-3].strip() if len(postcode) > 3 else postcode
 
 
 def advanced_search_companies(client: RotatingCHClient, params: dict) -> List[dict]:
@@ -248,26 +206,26 @@ def advanced_search_companies(client: RotatingCHClient, params: dict) -> List[di
     return results
 
 
-def search_sic_companies(client: RotatingCHClient, start_date: str, end_date: str) -> List[dict]:
+def search_sic_companies(client: RotatingCHClient, screening_date: str) -> List[dict]:
     return advanced_search_companies(
         client,
         {
-            "incorporated_from": start_date,
-            "incorporated_to": end_date,
+            "incorporated_from": screening_date,
+            "incorporated_to": screening_date,
             "sic_codes": ",".join(sorted(TARGET_SIC_CODES)),
         },
     )
 
 
-def search_buzzword_companies(client: RotatingCHClient, start_date: str, end_date: str) -> List[dict]:
+def search_buzzword_companies(client: RotatingCHClient, screening_date: str) -> List[dict]:
     results = []
     seen_numbers = set()
     for term in BUZZWORD_TERMS:
         items = advanced_search_companies(
             client,
             {
-                "incorporated_from": start_date,
-                "incorporated_to": end_date,
+                "incorporated_from": screening_date,
+                "incorporated_to": screening_date,
                 "company_name_includes": term,
             },
         )
@@ -279,7 +237,7 @@ def search_buzzword_companies(client: RotatingCHClient, start_date: str, end_dat
     return results
 
 
-def summarise_company(client: RotatingCHClient, company: dict) -> Optional[dict]:
+def summarise_company(company: dict) -> Optional[dict]:
     company_number = company.get("company_number")
     company_name = company.get("company_name", "")
     sic_codes = company.get("sic_codes", []) or []
@@ -299,32 +257,42 @@ def summarise_company(client: RotatingCHClient, company: dict) -> Optional[dict]
     }
 
 
-def collect_companies(client: RotatingCHClient, date_from: str, date_to: str, seen_companies: set) -> List[dict]:
+def collect_companies(client: RotatingCHClient, screening_date: str, seen_companies: set, progress_bar=None, progress_text=None) -> List[dict]:
     all_rows = []
 
-    for chunk_start, chunk_end in daterange_chunks(parse_date(date_from), parse_date(date_to), chunk_days=14):
-        chunk_from = chunk_start.strftime("%Y-%m-%d")
-        chunk_to = chunk_end.strftime("%Y-%m-%d")
+    sic_companies = search_sic_companies(client, screening_date)
+    if progress_bar:
+        progress_bar.progress(25, text="Fetched SIC-based company results")
 
-        sic_companies = search_sic_companies(client, chunk_from, chunk_to)
-        buzzword_companies = search_buzzword_companies(client, chunk_from, chunk_to)
+    buzzword_companies = search_buzzword_companies(client, screening_date)
+    if progress_bar:
+        progress_bar.progress(55, text="Fetched buzzword-based company results")
 
-        combined = {}
-        for company in sic_companies:
-            company_number = company.get("company_number")
-            if company_number and company_number not in seen_companies:
-                combined[company_number] = company
-        for company in buzzword_companies:
-            company_number = company.get("company_number")
-            if company_number and company_number not in seen_companies:
-                combined[company_number] = company
+    combined = {}
+    for company in sic_companies:
+        company_number = company.get("company_number")
+        if company_number and company_number not in seen_companies:
+            combined[company_number] = company
+    for company in buzzword_companies:
+        company_number = company.get("company_number")
+        if company_number and company_number not in seen_companies:
+            combined[company_number] = company
 
-        for company_number, company in combined.items():
-            row = summarise_company(client, company)
-            if row is None:
-                continue
-            all_rows.append(row)
-            seen_companies.add(company_number)
+    total = len(combined)
+    if total == 0:
+        if progress_bar:
+            progress_bar.progress(100, text="No new companies found for this date")
+        return []
+
+    for i, company in enumerate(combined.values(), start=1):
+        row = summarise_company(company)
+        if row is None:
+            continue
+        all_rows.append(row)
+        seen_companies.add(row["company_number"])
+        if progress_bar:
+            pct = 55 + int((i / total) * 45)
+            progress_bar.progress(min(pct, 100), text=f"Processing new companies: {i}/{total}")
 
     return all_rows
 
@@ -349,6 +317,12 @@ def load_results_df() -> pd.DataFrame:
     return pd.DataFrame()
 
 
+def filter_results_by_date(df: pd.DataFrame, screening_date: str) -> pd.DataFrame:
+    if df.empty or "company_number" not in df.columns:
+        return df
+    return df
+
+
 def prepare_display_df(df: pd.DataFrame) -> pd.DataFrame:
     if df.empty:
         return df
@@ -360,18 +334,20 @@ def prepare_display_df(df: pd.DataFrame) -> pd.DataFrame:
     return display_df.rename(columns={"company_name": "Company Name"})
 
 
-def run_pipeline(api_keys: List[str], date_from: str, date_to: str):
+def run_pipeline(api_keys: List[str], screening_date: str, progress_bar=None):
     seen_companies = set(load_json_file(SEEN_FILE, []))
+    previous_seen_count = len(seen_companies)
     client = RotatingCHClient(api_keys, rotate_every=599)
 
     started = time.time()
-    rows = collect_companies(client, date_from, date_to, seen_companies)
+    rows = collect_companies(client, screening_date, seen_companies, progress_bar=progress_bar)
 
     save_json_file(SEEN_FILE, sorted(seen_companies))
     write_results_csv(rows, RESULTS_FILE)
 
     elapsed = round(time.time() - started, 2)
-    return rows, elapsed
+    new_count = len(seen_companies) - previous_seen_count
+    return rows, elapsed, new_count
 
 
 def build_copy_button_html(text_to_copy: str, button_label: str = "Copy") -> str:
@@ -455,16 +431,20 @@ def render_interactive_results(df: pd.DataFrame):
 def main():
     st.set_page_config(page_title="Companies House Finder", layout="wide")
     st.title("Companies House Finder")
-    st.caption("Streamlined build for faster Companies House searches and one-click company-name copy.")
+    st.caption("Single-day screening with faster result refresh and one-click company-name copy.")
+
+    if "last_new_results" not in st.session_state:
+        st.session_state.last_new_results = 0
+    if "last_runtime" not in st.session_state:
+        st.session_state.last_runtime = None
+    if "last_screening_date" not in st.session_state:
+        st.session_state.last_screening_date = None
 
     api_keys = get_api_keys_from_sources()
 
     with st.sidebar:
         st.header("Controls")
-        default_to = datetime.utcnow().date()
-        default_from = default_to - timedelta(days=14)
-        date_from = st.date_input("Date from", value=default_from)
-        date_to = st.date_input("Date to", value=default_to)
+        screening_date = st.date_input("Screening date", value=datetime.utcnow().date())
         auto_refresh = st.checkbox("Auto refresh page", value=False)
         auto_run = st.checkbox("Run pipeline on refresh", value=False)
 
@@ -479,15 +459,29 @@ def main():
         st.error("No Companies House API keys found. Set COMPANIES_HOUSE_API_KEYS in Streamlit secrets or environment variables.")
         st.stop()
 
-    run_now = st.button("Run pipeline now", type="primary")
+    metric_cols = st.columns(3)
+    metric_cols[0].metric("New results since refresh", st.session_state.last_new_results)
+    metric_cols[1].metric("Last runtime (sec)", st.session_state.last_runtime if st.session_state.last_runtime is not None else "-")
+    metric_cols[2].metric("Last screened date", str(st.session_state.last_screening_date) if st.session_state.last_screening_date else "-")
+
+    progress_bar = st.progress(0, text="Waiting to run screen")
+
+    run_now = st.button("Run screen", type="primary")
     should_auto_run = auto_refresh and auto_run
 
     if run_now or should_auto_run:
-        with st.spinner("Running streamlined Companies House pipeline..."):
-            rows, elapsed = run_pipeline(api_keys, str(date_from), str(date_to))
-        st.success(f"Pipeline completed. New companies added: {len(rows)}. Runtime: {elapsed} seconds.")
+        with st.spinner("Running single-day Companies House screen..."):
+            rows, elapsed, new_count = run_pipeline(api_keys, str(screening_date), progress_bar=progress_bar)
+        st.session_state.last_new_results = new_count
+        st.session_state.last_runtime = elapsed
+        st.session_state.last_screening_date = str(screening_date)
+        progress_bar.progress(100, text=f"Completed. New results found: {new_count}")
+        st.success(f"Screen completed. New companies added: {len(rows)}. Runtime: {elapsed} seconds.")
+    else:
+        progress_bar.progress(min(st.session_state.last_new_results, 100) if st.session_state.last_new_results else 0, text="Ready to run screen")
 
     results_df = load_results_df()
+
     if not results_df.empty:
         st.download_button(
             "Download CSV",
