@@ -328,4 +328,6 @@ def collect_companies(
 ) -> List[dict]:
     all_rows = []
 
-    for chunk_start, chunk_end in daterange_chunks(parse_date(date_from), parse_date(date_to), ch
+    for chunk_start, chunk_end in daterange_chunks(
+        parse_date(date_from),
+        parse_
