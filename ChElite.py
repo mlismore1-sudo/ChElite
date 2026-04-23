@@ -383,25 +383,17 @@ def collect_companies(
                     if appt_count > 1:
                         has_multi_appointment_director = True
 
-            first_director_name = director_names[0] if director_names else ""
 
             row = {
                 "company_name": company_name,
                 "company_number": company_number,
                 "SIC Group": get_sic_group(sic_codes, company_name),
                 "Directors": len(directors),
-                "sic_codes": "; ".join(sic_codes),
                 "Postcode": trim_postcode_area(ro_postcode),
                 "In Target Postcode": postcode_prefix_matches(ro_postcode),
                 "international?": has_target_country,
                 "Serial Founder": has_multi_appointment_director,
-                "Assumed Email": make_assumed_email(first_director_name, company_name),
             }
-
-            for i, name in enumerate(director_names, start=1):
-                row[f"director_{i}_name"] = name
-            for i, pc in enumerate(director_postcodes, start=1):
-                row[f"director_{i}_postcode"] = pc
 
             all_rows.append(row)
             seen_companies.add(company_number)
@@ -451,10 +443,8 @@ def prepare_display_df(df: pd.DataFrame) -> pd.DataFrame:
 
     ordered_cols = [
         "company_name",
-        "Assumed Email",
         "SIC Group",
         "Directors",
-        "sic_codes",
         "Postcode",
         "In Target Postcode",
         "international?",
@@ -467,7 +457,6 @@ def prepare_display_df(df: pd.DataFrame) -> pd.DataFrame:
 
     rename_map = {
         "company_name": "Company Name",
-        "sic_codes": "SIC Codes",
     }
     return display_df.rename(columns=rename_map)
 
@@ -491,57 +480,27 @@ def build_copy_button_html(text_to_copy: str, button_label: str = "Copy") -> str
     safe_input_value = html.escape(text_to_copy or "", quote=True)
     safe_button_label = html.escape(button_label, quote=True)
 
-    return f"""
+    template = """
     <html>
       <head>
-        <meta charset=\"UTF-8\">
+        <meta charset="UTF-8">
         <style>
-          body {{
-            margin: 0;
-            font-family: 'Source Sans Pro', sans-serif;
-            background: transparent;
-          }}
-          .wrap {{
-            display: flex;
-            align-items: center;
-            gap: 8px;
-            width: 100%;
-            overflow: hidden;
-            padding: 2px 0;
-          }}
-          .name {{
-            flex: 1;
-            min-width: 0;
-            white-space: nowrap;
-            overflow: hidden;
-            text-overflow: ellipsis;
-            font-size: 14px;
-            line-height: 1.3;
-          }}
-          button {{
-            border: 1px solid rgba(49, 51, 63, 0.2);
-            border-radius: 8px;
-            background: white;
-            padding: 4px 10px;
-            font-size: 12px;
-            cursor: pointer;
-            white-space: nowrap;
-          }}
-          button:hover {{
-            background: #f5f7fb;
-          }}
+          body {{ margin: 0; font-family: 'Source Sans Pro', sans-serif; background: transparent; }}
+          .wrap {{ display: flex; align-items: center; gap: 8px; width: 100%; overflow: hidden; padding: 2px 0; }}
+          .name {{ flex: 1; min-width: 0; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; font-size: 14px; line-height: 1.3; }}
+          button {{ border: 1px solid #991b1b; border-radius: 8px; background: #dc2626; color: white; padding: 4px 10px; font-size: 12px; font-weight: 600; cursor: pointer; white-space: nowrap; }}
+          button:hover {{ background: #b91c1c; }}
         </style>
       </head>
       <body>
-        <div class=\"wrap\">
-          <div class=\"name\" title=\"{safe_input_value}\">{safe_display_text}</div>
-          <button id=\"copyButton\" type=\"button\">{safe_button_label}</button>
+        <div class="wrap">
+          <div class="name" title="__TITLE__">__TEXT__</div>
+          <button id="copyButton" type="button">__BUTTON__</button>
         </div>
-        <input id=\"textToCopy\" value=\"{safe_input_value}\" style=\"position:absolute;left:-9999px;top:-9999px;\" />
+        <input id="textToCopy" value="__VALUE__" style="position:absolute;left:-9999px;top:-9999px;" />
         <script>
           const copyButton = document.getElementById('copyButton');
           const textToCopy = document.getElementById('textToCopy');
-
           async function copyToClipboard() {{
             try {{
               await navigator.clipboard.writeText(textToCopy.value);
@@ -551,21 +510,24 @@ def build_copy_button_html(text_to_copy: str, button_label: str = "Copy") -> str
             }}
             const originalLabel = copyButton.textContent;
             copyButton.textContent = 'Copied';
-            setTimeout(() => {{
-              copyButton.textContent = originalLabel;
-            }}, 1000);
+            setTimeout(() => {{ copyButton.textContent = originalLabel; }}, 1000);
           }}
-
           copyButton.addEventListener('click', copyToClipboard);
         </script>
       </body>
     </html>
     """
+    return (
+        template
+        .replace('__TITLE__', safe_input_value)
+        .replace('__TEXT__', safe_display_text)
+        .replace('__BUTTON__', safe_button_label)
+        .replace('__VALUE__', safe_input_value)
+    )
 
 
 def render_copy_company_name(company_name: str, company_number: str):
-    iframe_html = build_copy_button_html(company_name, "Copy")
-    components.html(iframe_html, height=42)
+    components.html(build_copy_button_html(company_name, "Copy"), height=42)
 
 
 def render_interactive_results(df: pd.DataFrame):
@@ -575,69 +537,31 @@ def render_interactive_results(df: pd.DataFrame):
 
     st.markdown("### Results")
 
-    header_cols = st.columns([2.6, 1.8, 1.1, 0.8, 1.8, 0.9, 1.0, 1.0, 1.0])
+    header_cols = st.columns([3.0, 1.4, 0.8, 1.0, 1.0, 1.0])
     headers = [
-        "Company Name",
-        "Assumed Email",
-        "SIC Group",
-        "Directors",
-        "SIC Codes",
-        "Postcode",
-        "Target PC",
-        "Intl",
-        "Serial Founder",
+        "Company Name", "SIC Group", "Directors",
+        "Postcode", "Intl", "Serial Founder"
     ]
     for col, label in zip(header_cols, headers):
         col.markdown(f"**{label}**")
 
     st.divider()
 
-    fixed_columns = {
-        "company_name",
-        "company_number",
-        "Assumed Email",
-        "SIC Group",
-        "Directors",
-        "sic_codes",
-        "Postcode",
-        "In Target Postcode",
-        "international?",
-        "Serial Founder",
-    }
-
     for _, row in df.iterrows():
-        cols = st.columns([2.6, 1.8, 1.1, 0.8, 1.8, 0.9, 1.0, 1.0, 1.0])
+        cols = st.columns([3.0, 1.4, 0.8, 1.0, 1.0, 1.0])
 
         with cols[0]:
             render_copy_company_name(str(row.get("company_name", "")), str(row.get("company_number", "")))
         with cols[1]:
-            st.write(row.get("Assumed Email", ""))
-        with cols[2]:
             st.write(row.get("SIC Group", ""))
-        with cols[3]:
+        with cols[2]:
             st.write(row.get("Directors", ""))
-        with cols[4]:
-            st.write(row.get("sic_codes", ""))
-        with cols[5]:
+        with cols[3]:
             st.write(row.get("Postcode", ""))
-        with cols[6]:
-            st.write("Yes" if bool(row.get("In Target Postcode", False)) else "No")
-        with cols[7]:
+        with cols[4]:
             st.write("Yes" if bool(row.get("international?", False)) else "No")
-        with cols[8]:
+        with cols[5]:
             st.write("Yes" if bool(row.get("Serial Founder", False)) else "No")
-
-        extra_data = {}
-        for column_name in df.columns:
-            if column_name in fixed_columns:
-                continue
-            value = row.get(column_name, "")
-            if pd.notna(value) and str(value).strip():
-                extra_data[column_name] = value
-
-        if extra_data:
-            with st.expander(f"More details · {row.get('company_name', '')}"):
-                st.json(extra_data)
 
         st.divider()
 
